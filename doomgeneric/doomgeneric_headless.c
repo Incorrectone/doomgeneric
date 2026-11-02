@@ -2,8 +2,10 @@
 //
 // Runs as fast as the CPU allows (never sleeps), which is what -timedemo wants.
 // Frames are keyed by gametic, not by call count: during screen wipes the engine
-// draws several frames for the same tic, and how many depends on wall-clock time.
-// Keying by tic keeps everything deterministic.
+// draws several frames for the same tic, and how far the wipe has got in each one
+// depends on wall-clock time. So we keep only the LAST picture drawn for each tic
+// (the finished one) and write it when the next tic starts. That keeps every
+// written frame deterministic.
 //
 // Environment variables (all optional):
 //   FRAMES=path        append one frame per tic (XRGB8888, little-endian)
@@ -14,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "doomgeneric.h"
@@ -23,12 +26,14 @@ extern int gametic;
 
 static FILE *frames_out = NULL;
 static int dump_tic = -1;
-static int last_tic = -1;
 static int tile_w = DOOMGENERIC_RESX, tile_h = DOOMGENERIC_RESY;
 static uint32_t *tile = NULL;
+static uint32_t *pending = NULL;        // last picture drawn for pending_tic
+static int pending_tic = -1;
+static void flush(void);
 static int *x0s, *x1s, *y0s, *y1s;      // source span for each output column / row
 
-static void write_ppm(int tic)
+static void write_ppm(int tic, const uint32_t *src)
 {
     char name[64];
     FILE *p;
@@ -41,7 +46,7 @@ static void write_ppm(int tic)
     fprintf(p, "P6\n%d %d\n255\n", DOOMGENERIC_RESX, DOOMGENERIC_RESY);
     for (i = 0; i < DOOMGENERIC_RESX * DOOMGENERIC_RESY; i++)
     {
-        uint32_t px = DG_ScreenBuffer[i];
+        uint32_t px = src[i];
         unsigned char rgb[3] = { (px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff };
         fwrite(rgb, 1, 3, p);
     }
@@ -49,7 +54,7 @@ static void write_ppm(int tic)
 }
 
 // Average every source pixel that falls inside each output pixel (box filter).
-static void shrink(void)
+static void shrink(const uint32_t *src)
 {
     int ox, oy, sx, sy;
 
@@ -60,7 +65,7 @@ static void shrink(void)
             uint32_t r = 0, g = 0, b = 0, n = 0;
             for (sy = y0s[oy]; sy < y1s[oy]; sy++)
             {
-                const uint32_t *row = DG_ScreenBuffer + sy * DOOMGENERIC_RESX;
+                const uint32_t *row = src + sy * DOOMGENERIC_RESX;
                 for (sx = x0s[ox]; sx < x1s[ox]; sx++)
                 {
                     uint32_t px = row[sx];
@@ -99,6 +104,8 @@ void DG_Init()
 
     if (f)
         frames_out = fopen(f, "wb");
+    pending = malloc(sizeof(uint32_t) * DOOMGENERIC_RESX * DOOMGENERIC_RESY);
+    atexit(flush);                      // write the final tic when the demo ends
     dump_tic = d ? atoi(d) : -1;
 
     if (tw && th && atoi(tw) > 0 && atoi(th) > 0
@@ -117,26 +124,34 @@ void DG_Init()
     }
 }
 
+static void flush(void)
+{
+    if (pending_tic < 0)
+        return;
+    if (pending_tic == dump_tic)
+        write_ppm(pending_tic, pending);
+    if (frames_out)
+    {
+        if (tile)
+        {
+            shrink(pending);
+            fwrite(tile, sizeof(uint32_t), tile_w * tile_h, frames_out);
+        }
+        else
+        {
+            fwrite(pending, sizeof(uint32_t), DOOMGENERIC_RESX * DOOMGENERIC_RESY, frames_out);
+        }
+        fflush(frames_out);
+    }
+    pending_tic = -1;
+}
+
 void DG_DrawFrame()
 {
-    if (gametic == last_tic)
-        return;                         // extra wipe frame for the same tic: skip
-    last_tic = gametic;
-
-    if (gametic == dump_tic)
-        write_ppm(gametic);
-    if (!frames_out)
-        return;
-    if (tile)
-    {
-        shrink();
-        fwrite(tile, sizeof(uint32_t), tile_w * tile_h, frames_out);
-    }
-    else
-    {
-        fwrite(DG_ScreenBuffer, sizeof(uint32_t),
-               DOOMGENERIC_RESX * DOOMGENERIC_RESY, frames_out);
-    }
+    if (gametic != pending_tic)
+        flush();                        // previous tic is finished: write its last picture
+    memcpy(pending, DG_ScreenBuffer, sizeof(uint32_t) * DOOMGENERIC_RESX * DOOMGENERIC_RESY);
+    pending_tic = gametic;
 }
 
 void DG_SleepMs(uint32_t ms)
