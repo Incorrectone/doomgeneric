@@ -6,8 +6,10 @@
 // Keying by tic keeps everything deterministic.
 //
 // Environment variables (all optional):
-//   FRAMES=path    append one raw frame per tic (RESX*RESY*4 bytes, XRGB8888)
-//   DUMP_TIC=N     also write the frame of tic N as frameN.ppm (quick visual check)
+//   FRAMES=path        append one frame per tic (XRGB8888, little-endian)
+//   TILE_W, TILE_H     shrink each frame to this size before writing (box filter);
+//                      default is the full RESX x RESY picture
+//   DUMP_TIC=N         also write the full-size frame of tic N as frameN.ppm
 
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +24,9 @@ extern int gametic;
 static FILE *frames_out = NULL;
 static int dump_tic = -1;
 static int last_tic = -1;
+static int tile_w = DOOMGENERIC_RESX, tile_h = DOOMGENERIC_RESY;
+static uint32_t *tile = NULL;
+static int *x0s, *x1s, *y0s, *y1s;      // source span for each output column / row
 
 static void write_ppm(int tic)
 {
@@ -43,14 +48,73 @@ static void write_ppm(int tic)
     fclose(p);
 }
 
+// Average every source pixel that falls inside each output pixel (box filter).
+static void shrink(void)
+{
+    int ox, oy, sx, sy;
+
+    for (oy = 0; oy < tile_h; oy++)
+    {
+        for (ox = 0; ox < tile_w; ox++)
+        {
+            uint32_t r = 0, g = 0, b = 0, n = 0;
+            for (sy = y0s[oy]; sy < y1s[oy]; sy++)
+            {
+                const uint32_t *row = DG_ScreenBuffer + sy * DOOMGENERIC_RESX;
+                for (sx = x0s[ox]; sx < x1s[ox]; sx++)
+                {
+                    uint32_t px = row[sx];
+                    r += (px >> 16) & 0xff;
+                    g += (px >> 8) & 0xff;
+                    b += px & 0xff;
+                    n++;
+                }
+            }
+            tile[oy * tile_w + ox] = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+        }
+    }
+}
+
+static int *spans(int out, int in, int upper)
+{
+    int *v = malloc(sizeof(int) * out);
+    int i;
+    for (i = 0; i < out; i++)
+    {
+        int a = (int) ((long) i * in / out);
+        int b = (int) ((long) (i + 1) * in / out);
+        if (b <= a)
+            b = a + 1;                  // never an empty span
+        v[i] = upper ? b : a;
+    }
+    return v;
+}
+
 void DG_Init()
 {
     const char *f = getenv("FRAMES");
     const char *d = getenv("DUMP_TIC");
+    const char *tw = getenv("TILE_W");
+    const char *th = getenv("TILE_H");
 
     if (f)
         frames_out = fopen(f, "wb");
     dump_tic = d ? atoi(d) : -1;
+
+    if (tw && th && atoi(tw) > 0 && atoi(th) > 0
+        && atoi(tw) <= DOOMGENERIC_RESX && atoi(th) <= DOOMGENERIC_RESY)
+    {
+        tile_w = atoi(tw);
+        tile_h = atoi(th);
+    }
+    if (tile_w != DOOMGENERIC_RESX || tile_h != DOOMGENERIC_RESY)
+    {
+        tile = malloc(sizeof(uint32_t) * tile_w * tile_h);
+        x0s = spans(tile_w, DOOMGENERIC_RESX, 0);
+        x1s = spans(tile_w, DOOMGENERIC_RESX, 1);
+        y0s = spans(tile_h, DOOMGENERIC_RESY, 0);
+        y1s = spans(tile_h, DOOMGENERIC_RESY, 1);
+    }
 }
 
 void DG_DrawFrame()
@@ -59,11 +123,20 @@ void DG_DrawFrame()
         return;                         // extra wipe frame for the same tic: skip
     last_tic = gametic;
 
-    if (frames_out)
-        fwrite(DG_ScreenBuffer, sizeof(uint32_t),
-               DOOMGENERIC_RESX * DOOMGENERIC_RESY, frames_out);
     if (gametic == dump_tic)
         write_ppm(gametic);
+    if (!frames_out)
+        return;
+    if (tile)
+    {
+        shrink();
+        fwrite(tile, sizeof(uint32_t), tile_w * tile_h, frames_out);
+    }
+    else
+    {
+        fwrite(DG_ScreenBuffer, sizeof(uint32_t),
+               DOOMGENERIC_RESX * DOOMGENERIC_RESY, frames_out);
+    }
 }
 
 void DG_SleepMs(uint32_t ms)
